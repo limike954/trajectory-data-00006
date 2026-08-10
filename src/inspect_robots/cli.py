@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import html
 import json
 import math
 import os
@@ -106,7 +107,17 @@ _KIND_BY_PLURAL = {
 
 _PLURAL_BY_KIND = {kind: plural for plural, kind in _KIND_BY_PLURAL.items()}
 
-_SUBCOMMANDS = ("list", "run", "eval-set", "inspect", "video", "config", "setup", "doctor")
+_SUBCOMMANDS = (
+    "list",
+    "run",
+    "eval-set",
+    "inspect",
+    "view",
+    "video",
+    "config",
+    "setup",
+    "doctor",
+)
 
 _ENV_BY_KIND = {"policy": ENV_POLICY, "embodiment": ENV_EMBODIMENT}
 
@@ -259,6 +270,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--transcript",
         action="store_true",
         help="append recorded policy transcripts",
+    )
+
+    p_view = sub.add_parser("view", help="render a saved eval log as an HTML report")
+    p_view.add_argument("log", help="path to an EvalLog JSON file")
+    p_view.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="output HTML file (default: LOG.html; '-' writes to stdout)",
     )
 
     p_video = sub.add_parser(
@@ -1095,6 +1116,152 @@ def _cmd_inspect(path: str, *, transcript: bool = False) -> int:
     return 0 if log.status == "success" else 1
 
 
+def _html_cell(value: object) -> str:
+    """Escape one scalar value for placement in an HTML table cell."""
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def _metric_rows(metrics: dict[str, float]) -> str:
+    if not metrics:
+        return '<tr><td colspan="2">No summary metrics recorded.</td></tr>'
+    return "\n".join(
+        f"<tr><th>{_html_cell(name)}</th><td>{value:.6g}</td></tr>"
+        for name, value in sorted(metrics.items())
+    )
+
+
+def _scene_rows(log: EvalLog) -> str:
+    if not log.samples:
+        return '<tr><td colspan="5">No scene results recorded.</td></tr>'
+    rows = []
+    for scene in log.samples:
+        reduced = ", ".join(f"{name}={value:.6g}" for name, value in sorted(scene.reduced.items()))
+        rows.append(
+            "<tr>"
+            f"<td>{_html_cell(scene.scene_id)}</td>"
+            f"<td>{_html_cell(_display_status(scene.status))}</td>"
+            f"<td>{_html_cell(scene.instruction)}</td>"
+            f"<td>{_html_cell(reduced)}</td>"
+            f"<td>{_html_cell(scene.error)}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def _render_eval_log_html(log: EvalLog, source: str) -> str:
+    title = f"Inspect Robots report: {log.eval.task}"
+    trials = str(log.results.total_trials)
+    if log.results.errored_trials:
+        trials += f" ({log.results.errored_trials} errored)"
+    run_rows = [
+        ("Source log", source),
+        ("Task", log.eval.task),
+        ("Policy", log.eval.policy),
+        ("Embodiment", log.eval.embodiment),
+        ("Run status", _display_status(log.status)),
+        ("Created", log.eval.created),
+        ("Inspect Robots version", log.eval.inspect_robots_version),
+        ("Git commit", log.eval.git_commit),
+        ("Seed", log.eval.seed),
+        ("Max steps", log.eval.max_steps),
+        ("Started", log.stats.started_at),
+        ("Completed", log.stats.completed_at),
+        ("Duration", f"{log.stats.duration_s:.6g} s"),
+        ("Total steps", log.stats.total_steps),
+        (
+            "Mean inference latency",
+            None
+            if log.stats.mean_inference_latency_s is None
+            else f"{log.stats.mean_inference_latency_s:.6g} s",
+        ),
+        ("Frames directory", log.stats.frames_dir),
+        ("Scenes", log.results.total_scenes),
+        ("Trials", trials),
+        ("Schema version", log.version),
+    ]
+    metadata_rows = "\n".join(
+        f"<tr><th>{_html_cell(name)}</th><td>{_html_cell(value)}</td></tr>"
+        for name, value in run_rows
+    )
+    error = (
+        ""
+        if log.error is None
+        else f"<section><h2>Run Error</h2><pre>{_html_cell(log.error)}</pre></section>"
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{_html_cell(title)}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 2rem; color: #18202a; background: #f7f8fb; }}
+    main {{ max-width: 1100px; margin: 0 auto; }}
+    h1 {{ margin-bottom: 0.25rem; }}
+    .status {{ display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; }}
+    .status {{ background: #e7edf7; font-weight: 600; }}
+    section {{ margin-top: 1.5rem; padding: 1rem; background: white; }}
+    section {{ border: 1px solid #dfe5ee; border-radius: 0.75rem; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border-bottom: 1px solid #e8edf4; padding: 0.55rem 0.7rem; }}
+    th, td {{ text-align: left; vertical-align: top; }}
+    th {{ width: 16rem; color: #39475a; }}
+    thead th {{ width: auto; background: #f0f4fa; }}
+    pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>{_html_cell(log.eval.task)}</h1>
+  <div class="status">{_html_cell(_display_status(log.status))}</div>
+  <section>
+    <h2>Run Metadata</h2>
+    <table><tbody>
+{metadata_rows}
+    </tbody></table>
+  </section>
+  <section>
+    <h2>Summary Metrics</h2>
+    <table><tbody>
+{_metric_rows(log.results.metrics)}
+    </tbody></table>
+  </section>
+  <section>
+    <h2>Scenes</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Scene</th><th>Status</th><th>Instruction</th><th>Reduced Scores</th><th>Error</th>
+        </tr>
+      </thead>
+      <tbody>
+{_scene_rows(log)}
+      </tbody>
+    </table>
+  </section>
+  {error}
+</main>
+</body>
+</html>
+"""
+
+
+def _cmd_view(args: argparse.Namespace) -> int:
+    """Render a saved evaluation log to a standalone HTML report."""
+    from inspect_robots import read_eval_log
+
+    log = read_eval_log(args.log)
+    report = _render_eval_log_html(log, args.log)
+    if args.out == "-":
+        print(report, end="")
+        return 0
+    out_path = Path(args.out) if args.out is not None else Path(args.log).with_suffix(".html")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report, encoding="utf-8")
+    print(f"wrote {out_path}")
+    return 0
+
+
 def _cmd_video(args: argparse.Namespace) -> int:
     """Render a log's stored frames to one MP4 per (trial, camera) stream.
 
@@ -1277,6 +1444,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_eval_set(args)
     if args.command == "inspect":
         return _cmd_inspect(args.log, transcript=args.transcript)
+    if args.command == "view":
+        return _cmd_view(args)
     if args.command == "video":
         return _cmd_video(args)
     if args.command == "config":
